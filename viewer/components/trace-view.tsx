@@ -200,16 +200,17 @@ function Header({ trace, onBack }: { trace: Trajectory; onBack?: () => void }) {
 export function TraceView({ trace, onBack }: { trace: Trajectory; onBack?: () => void }) {
   const [showContext, setShowContext] = useState(false);
   const [limit, setLimit] = useState(100);
-  const messages = useMemo(() => traceToMessages(trace, showContext), [trace, showContext]);
+  const messages = useMemo(() => traceToMessages(trace, showContext, limit), [trace, showContext, limit]);
+  const hasMore = messages.length === limit && messages.at(-1)?.node !== trace.steps.at(-1)?.step_id;
   return (
     <div className="flex h-full min-h-0 flex-col">
       <Header trace={trace} onBack={onBack} />
       <label className="border-b px-4 py-1 text-xs text-muted-foreground">
-        <input type="checkbox" checked={showContext} onChange={e => setShowContext(e.target.checked)} /> Show copied context · {messages.length} messages
+        <input type="checkbox" checked={showContext} onChange={e => { setShowContext(e.target.checked); setLimit(100); }} /> Show copied context · showing {messages.length} messages
       </label>
       <Conversation className="min-h-0 flex-1" initial={false}>
         <ConversationContent className="gap-4 p-2 md:p-4">
-          {messages.slice(0, limit).map((message) => {
+          {messages.map((message) => {
             if (message.role === "system") {
               const text = message.parts.map((p) => (p.type === "text" ? p.text : "")).join("");
               return <PromptBlock key={message.id} label="system prompt (harness)" text={text} defaultOpen={false} />;
@@ -220,7 +221,7 @@ export function TraceView({ trace, onBack }: { trace: Trajectory; onBack?: () =>
             }
             return <AssistantTurn key={message.id} message={message} />;
           })}
-          {limit < messages.length && <Button variant="outline" onClick={() => setLimit(n => n + 100)}>Show next 100 messages ({messages.length - limit} remaining)</Button>}
+          {hasMore && <Button variant="outline" onClick={() => setLimit(n => n + 100)}>Show next 100 messages</Button>}
         </ConversationContent>
         <ConversationScrollButton />
       </Conversation>

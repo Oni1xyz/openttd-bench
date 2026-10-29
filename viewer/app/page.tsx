@@ -9,6 +9,7 @@ import {
   agentSeconds,
   formatSeconds,
   parseAtif,
+  parseAtifFile,
   traceMeta,
   traceId,
   rewardValue,
@@ -24,7 +25,6 @@ type RunEntry = { path: string; name: string; group: string; mtime: number; size
 
 export default function Page() {
   const [runs, setRuns] = useState<RunEntry[]>([]);
-  const [root, setRoot] = useState<string>("");
   const [listError, setListError] = useState<string | null>(null);
   const [run, setRun] = useState<ParsedRun | null>(null);
   const [selected, setSelected] = useState<{ episode: number; trace: number }>({ episode: 0, trace: 0 });
@@ -35,10 +35,9 @@ export default function Page() {
   const refresh = useCallback(async () => {
     try {
       const res = await fetch("/api/runs");
-      const data = (await res.json()) as { root: string; runs: RunEntry[]; error?: string };
+      const data = (await res.json()) as { runs: RunEntry[]; error?: string };
       if (data.error) throw new Error(data.error);
       setRuns(data.runs);
-      setRoot(data.root);
       setListError(null);
     } catch (error) {
       setListError(String(error));
@@ -68,7 +67,7 @@ export default function Page() {
 
   const openFile = useCallback(async (file: File) => {
     try {
-      setRun(parseAtif(await file.text(), file.name));
+      setRun(await parseAtifFile(file));
       setSelected({ episode: 0, trace: 0 });
       setMobileView("list");
       setListError(null);
@@ -110,7 +109,7 @@ export default function Page() {
               }}
             />
           </label>
-          {root && <div className="truncate text-muted-foreground text-xs" title={root}>runs under {root}</div>}
+          <div className="text-muted-foreground text-xs">Local runs · bounded discovery (see README)</div>
           {listError && <div className="text-destructive text-xs">{listError}</div>}
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto">

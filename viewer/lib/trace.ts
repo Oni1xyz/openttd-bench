@@ -1,5 +1,6 @@
 /* ATIF-only reader and presentation helpers. No native/Prime parsing lives here. */
 import type { DynamicToolUIPart, UIMessage } from "ai";
+import { LIMITS, checkJsonBudget, checkTextBytes, isRecord, jsonBudget, parseJson, type JsonBudget } from "./limits";
 
 export type Benchmark = {
   id?: string;
@@ -41,19 +42,71 @@ export type ParsedRun = { name: string; episodes: Episode[] };
 export const traceId = (t: Trajectory): string => t.trajectory_id ?? t.session_id ?? t.agent.name;
 export const traceMeta = (t: Trajectory): Benchmark => t.extra?.benchmark ?? {};
 
-export function parseAtif(text: string, name = "trajectory.atif.json"): ParsedRun {
-  const value: unknown = JSON.parse(text);
-  const roots = Array.isArray(value) ? value : [value];
+function optionalStrings(value: Record<string, unknown>, keys: string[]): void {
+  for (const key of keys) if (value[key] !== undefined && typeof value[key] !== "string") throw new Error("Invalid ATIF string");
+}
+function optionalArray(value: unknown, max: number): unknown[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("Invalid ATIF collection");
+  if (value.length > max) throw new Error("ATIF collection limit exceeded");
+  return value;
+}
+export function validateTrajectories(value: unknown, budget: JsonBudget = jsonBudget(), allowArray = true): Trajectory[] {
+  checkJsonBudget(value, budget);
+  const roots = allowArray && Array.isArray(value) ? value : [value];
   if (!roots.length) throw new Error("No ATIF trajectories");
-  const episodes = new Map<string, Episode>();
-  function validate(t: Trajectory): void {
-    if (!/^ATIF-v1\.[0-8]$/.test(t?.schema_version) || !t.agent || !Array.isArray(t.steps) || !t.steps.length)
-      throw new Error("Expected an ATIF trajectory (convert native traces first)");
-    t.steps.forEach((s, i) => {
-      if (s.step_id !== i + 1 || !["system", "user", "agent"].includes(s.source)) throw new Error("Invalid ATIF step");
-    });
-    t.subagent_trajectories?.forEach(validate);
+  if (roots.length > budget.trajectories) throw new Error("ATIF trajectory limit exceeded");
+  const pending = [...roots];
+  while (pending.length) {
+    const t = pending.pop();
+    if (--budget.trajectories < 0) throw new Error("ATIF trajectory limit exceeded");
+    if (!isRecord(t) || typeof t.schema_version !== "string" || !/^ATIF-v1\.[0-8]$/.test(t.schema_version) ||
+        !isRecord(t.agent) || typeof t.agent.name !== "string" || typeof t.agent.version !== "string" ||
+        !Array.isArray(t.steps) || !t.steps.length) throw new Error("Expected an ATIF trajectory (convert native traces first)");
+    optionalStrings(t, ["trajectory_id", "session_id"]);
+    optionalStrings(t.agent, ["model_name"]);
+    if (t.extra !== undefined) {
+      if (!isRecord(t.extra)) throw new Error("Invalid ATIF metadata");
+      for (const key of ["episode", "benchmark"]) if (t.extra[key] !== undefined && !isRecord(t.extra[key])) throw new Error("Invalid ATIF metadata");
+      if (isRecord(t.extra.episode)) optionalStrings(t.extra.episode, ["id"]);
+    }
+    if (t.steps.length > budget.steps) throw new Error("ATIF step limit exceeded");
+    budget.steps -= t.steps.length;
+    for (const [i, step] of t.steps.entries()) {
+      if (!isRecord(step) || step.step_id !== i + 1 || typeof step.source !== "string" || !["system", "user", "agent"].includes(step.source)) throw new Error("Invalid ATIF step");
+      optionalStrings(step, ["reasoning_content", "timestamp", "model_name"]);
+      if (step.is_copied_context !== undefined && typeof step.is_copied_context !== "boolean") throw new Error("Invalid ATIF context flag");
+      const ids = new Set<string>();
+      for (const call of optionalArray(step.tool_calls, LIMITS.toolCalls)) {
+        if (!isRecord(call) || typeof call.tool_call_id !== "string" || typeof call.function_name !== "string" || !isRecord(call.arguments) || ids.has(call.tool_call_id))
+          throw new Error("Invalid or duplicate ATIF tool call");
+        ids.add(call.tool_call_id);
+      }
+      if (step.observation !== undefined) {
+        if (!isRecord(step.observation) || !Array.isArray(step.observation.results)) throw new Error("Invalid ATIF observation");
+        for (const result of optionalArray(step.observation.results, LIMITS.results)) {
+          if (!isRecord(result)) throw new Error("Invalid ATIF observation");
+          optionalStrings(result, ["source_call_id"]);
+          for (const ref of optionalArray(result.subagent_trajectory_ref, LIMITS.trajectories)) {
+            if (!isRecord(ref)) throw new Error("Invalid ATIF reference");
+            optionalStrings(ref, ["trajectory_id", "trajectory_path"]);
+          }
+        }
+      }
+    }
+    for (const child of optionalArray(t.subagent_trajectories, budget.trajectories)) pending.push(child);
   }
+  return roots as Trajectory[];
+}
+
+export async function parseAtifFile(file: Pick<File, "size" | "name" | "text">): Promise<ParsedRun> {
+  if (!Number.isSafeInteger(file.size) || file.size < 0 || file.size > LIMITS.runBytes) throw new Error("File byte limit exceeded");
+  return parseAtif(await file.text(), file.name);
+}
+export function parseAtif(text: string, name = "trajectory.atif.json"): ParsedRun {
+  checkTextBytes(text);
+  const roots = validateTrajectories(parseJson(text));
+  const episodes = new Map<string, Episode>();
   function append(t: Trajectory, ep: Episode, parent?: Trajectory): void {
     if (parent) {
       const meta = traceMeta(parent);
@@ -65,8 +118,7 @@ export function parseAtif(text: string, name = "trajectory.atif.json"): ParsedRu
     ep.traces.push(t);
     for (const child of t.subagent_trajectories ?? []) append(child, ep, t);
   }
-  for (const t of roots as Trajectory[]) {
-    validate(t);
+  for (const t of roots) {
     const metadata = t.extra?.episode;
     const id = metadata?.id ?? t.session_id ?? traceId(t);
     let ep = episodes.get(id);
@@ -119,32 +171,45 @@ export function contentText(value: unknown): string {
   if (Array.isArray(value)) return value.map(v => v?.type === "text" ? v.text : JSON.stringify(v)).join("\n");
   return JSON.stringify(value);
 }
-export function traceToMessages(t: Trajectory, showContext = false): ViewerMessage[] {
+export function traceToMessages(t: Trajectory, showContext = false, limit: number = LIMITS.steps): ViewerMessage[] {
+  if (!Number.isSafeInteger(limit) || limit < 0 || limit > LIMITS.steps) throw new Error("Invalid message limit");
+  const messages: ViewerMessage[] = [];
   let turn = 0, lastDate: string | undefined;
-  return t.steps.flatMap(s => {
-    if (s.is_copied_context && !showContext) return [];
+  for (const s of t.steps) {
+    // Stop BEFORE serializing message bodies or joining observations off-screen.
+    if (messages.length >= limit) break;
+    if (s.is_copied_context && !showContext) continue;
     const parts: ViewerMessage["parts"] = [];
     if (s.reasoning_content) parts.push({ type: "reasoning", text: s.reasoning_content, state: "done" });
     const message = contentText(s.message);
     if (message) parts.push({ type: "text", text: message });
     const results = s.observation?.results ?? [];
-    const consumed = new Set<number>();
+    const consumed = new Set<string>();
+    const outputs = results.map(r => contentText(r.content));
+    const byCall = new Map<string, string[]>();
+    results.forEach((r, i) => {
+      if (r.source_call_id === undefined) return;
+      const group = byCall.get(r.source_call_id) ?? [];
+      group.push(outputs[i]);
+      byCall.set(r.source_call_id, group);
+    });
     let date: string | undefined;
     for (const call of s.tool_calls ?? []) {
-      const matched = results.filter((r, i) => { if (r.source_call_id === call.tool_call_id) { consumed.add(i); return true; } return false; });
-      const output = matched.map(r => contentText(r.content)).join("\n");
+      const matched = byCall.get(call.tool_call_id) ?? [];
+      consumed.add(call.tool_call_id);
+      const output = matched.join("\n");
       const part: DynamicToolUIPart = matched.length
         ? { type: "dynamic-tool", toolName: call.function_name, toolCallId: call.tool_call_id, input: call.arguments, output, state: "output-available" }
         : { type: "dynamic-tool", toolName: call.function_name, toolCallId: call.tool_call_id, input: call.arguments, state: "input-available" };
       parts.push(part);
     }
     results.forEach((r, i) => {
-      const output = contentText(r.content);
+      const output = outputs[i];
       for (const m of output.matchAll(/"text":\s*"(\d{4}-\d{2}-\d{2})"/g)) date = m[1];
-      if (!consumed.has(i)) parts.push({ type: "text", text: output });
+      if (r.source_call_id === undefined || !consumed.has(r.source_call_id)) parts.push({ type: "text", text: output });
       if (r.subagent_trajectory_ref?.length) parts.push({ type: "text", text: `Subagents: ${r.subagent_trajectory_ref.map(ref => ref.trajectory_id ?? ref.trajectory_path).join(", ")} (select in sidebar)` });
     });
-    if (!parts.length) return [];
+    if (!parts.length) continue;
     const calls = s.metrics?.extra?.calls ?? [];
     const usage = s.metrics?.extra?.usage;
     const stats = s.metrics ? { promptTokens: s.metrics.prompt_tokens, completionTokens: s.metrics.completion_tokens,
@@ -153,9 +218,10 @@ export function traceToMessages(t: Trajectory, showContext = false): ViewerMessa
       finish: calls.at(-1)?.finish_reason } : undefined;
     const gameDate = date && date !== lastDate ? date : undefined;
     if (date) lastDate = date;
-    return [{ id: `s${s.step_id}`, node: s.step_id, role: s.source === "agent" || results.length ? "assistant" : s.source,
-      parts, stats, gameDate, turn: s.source === "agent" ? ++turn : undefined } as ViewerMessage];
-  });
+    messages.push({ id: `s${s.step_id}`, node: s.step_id, role: s.source === "agent" || results.length ? "assistant" : s.source,
+      parts, stats, gameDate, turn: s.source === "agent" ? ++turn : undefined } as ViewerMessage);
+  }
+  return messages;
 }
 export function formatMoney(value: unknown): string {
   if (typeof value !== "number") return "–";

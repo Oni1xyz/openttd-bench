@@ -1,14 +1,13 @@
-import { NextResponse } from "next/server";
-
-import { listRuns, outputsDir } from "@/lib/server-runs";
+import { listRuns } from "@/lib/server-runs";
+import { forbidden, isLocalRequest, localHeaders } from "@/lib/local-request";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function GET(request: Request) {
+  if (!isLocalRequest(request)) return forbidden();
   try {
-    const runs = await listRuns();
-    return NextResponse.json({ root: outputsDir(), runs });
-  } catch (error) {
-    return NextResponse.json({ error: String(error) }, { status: 500 });
+    return Response.json({ runs: await listRuns() }, { headers: localHeaders });
+  } catch {
+    return Response.json({ error: "Run listing unavailable" }, { status: 503, headers: localHeaders });
   }
 }

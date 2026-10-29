@@ -1,15 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtemp, mkdir, readFile, writeFile, symlink, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, symlink, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import ts from 'typescript';
-
-async function load(file) {
-  const source = await readFile(new URL(file, import.meta.url), 'utf8');
-  const { outputText } = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } });
-  return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
-}
+import { load } from './load-ts.mjs';
 const { parseAtif, traceToMessages } = await load('../lib/trace.ts');
 const { listRuns, readRun } = await load('../lib/server-runs.ts');
 const doc = {
