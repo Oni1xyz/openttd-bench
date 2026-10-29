@@ -32,7 +32,7 @@ labels=("${meta[@]:6}")
 ) >"$OUT/eval.log" 2>&1 &
 eval_pid=$!
 echo "$eval_pid" >"$OUT/eval.pid"
-.venv/bin/python scripts/watch_run.py "$OUT" --topic small-pineapple-good-morning --pid "$eval_pid" \
+.venv/bin/python scripts/watch_run.py "$OUT" --topic "${OPENTTD_NOTIFY_TOPIC:-}" --pid "$eval_pid" \
   --label "$LABEL" --episodes 1 --heartbeat 15 --progress "$OUT/progress" \
   --seat-labels "${labels[@]}" \
   --start-note "$LABEL launching: ${labels[*]}. Seed $SEED, 0.75x, 800k each, no loans, corrected ledger; LLM seats use Codex $CODEX_VERSION high reasoning. About 2h43 game time. Progress every 15 minutes." \
@@ -42,9 +42,9 @@ echo "$watch_pid" >"$OUT/watch.pid"
 (
   .venv/bin/python scripts/verify_mixed_start.py "$OUT" --pid "$eval_pid" --task-id "${TASK_ID:-codex-model-series}" --llm-seats "$LLM_SEATS" --companies "$COMPANIES" &&
   .venv/bin/python - "$LABEL" <<'PY'
-import sys
+import os,sys
 from scripts.watch_run import post
-post('small-pineapple-good-morning', 'OpenTTD: startup verified', sys.argv[1] + ': clock moving, all LLM seats active; initial funding, roster and ledger checks passed.')
+post(os.environ.get('OPENTTD_NOTIFY_TOPIC', ''), 'OpenTTD: startup verified', sys.argv[1] + ': clock moving, all LLM seats active; initial funding, roster and ledger checks passed.')
 PY
 ) >"$OUT/verification.json" 2>&1 &
 verify_pid=$!

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check exact locks against registry integrity, release age and OSV (no installs)."""
+"""Audit Python/baked-agent locks; audit the viewer separately with npm run audit:lock."""
 from __future__ import annotations
 import argparse
 import base64
@@ -39,7 +39,9 @@ def check_age(value: str, cutoff: datetime):
     if instant(value) > cutoff:
         raise ValueError(f"release/artifact newer than cutoff: {value}")
 
-def inventory(root: Path, python_only=False):
+def inventory(root: Path, python_only=True):
+    if not python_only:
+        raise ValueError("use viewer npm run audit:lock for bundled viewer dependencies")
     lock = tomllib.loads((root / "uv.lock").read_text())
     records = {}
     for p in lock["package"]:
@@ -53,12 +55,8 @@ def inventory(root: Path, python_only=False):
         key = ("PyPI", p["name"], p["version"])
         records[key] = {"key": key, "artifacts": [*p.get("wheels", []), *([p["sdist"]] if p.get("sdist") else [])]}
     npm_locks = [root / "image/agent/package-lock.json"]
-    if not python_only:
-        npm_locks.append(root / "viewer/package-lock.json")
     for file in npm_locks:
         if not file.exists():
-            if file.parts[-3:-1] == ("image", "agent"):
-                continue
             raise ValueError(f"missing npm lock: {file}")
         lock = json.loads(file.read_text())
         for location, p in lock["packages"].items():
@@ -100,7 +98,7 @@ def verify_record(record, cutoff, npm_meta=None):
                 raise ValueError("invalid SHA-512 integrity")
     return {"ecosystem": ecosystem, "name": name, "version": version, "artifacts": len(record["artifacts"])}
 
-def audit(root: Path, python_only=False, metadata=True):
+def audit(root: Path, python_only=True, metadata=True):
     config = tomllib.loads((root / "pyproject.toml").read_text())
     cutoff = instant(config["tool"]["uv"]["exclude-newer"])
     now = datetime.now(timezone.utc)
@@ -148,9 +146,7 @@ def audit(root: Path, python_only=False, metadata=True):
         query_count += len(batch)
     assert query_count == len(packages)
     files = [root / "uv.lock", root / "pyproject.toml", root / "image/agent/package-lock.json"]
-    if not python_only:
-        files.append(root / "viewer/package-lock.json")
-    return {"cutoff": cutoff.isoformat(), "checked_at": now.isoformat(), "package_versions": len(packages),
+    return {"scope": "python_and_baked_agent", "cutoff": cutoff.isoformat(), "checked_at": now.isoformat(), "package_versions": len(packages),
             "registry_packages_verified": len(checked), "registry_errors": errors,
             "osv_queries_verified": query_count, "affected_package_versions": len(matches), "matches": matches,
             "metadata_check_enabled": metadata,
@@ -159,7 +155,7 @@ def audit(root: Path, python_only=False, metadata=True):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--python-only", action="store_true", help="Skip optional viewer (still checks baked agent lock if present)")
+    parser.add_argument("--python-only", action="store_true", default=True, help="Compatibility flag; Python and baked agent is now the default scope")
     parser.add_argument("--advisories-only", action="store_true", help="Diagnostic only: does not attest registry age/integrity")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
