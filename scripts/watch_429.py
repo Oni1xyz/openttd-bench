@@ -9,10 +9,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import time
-import urllib.request
 from pathlib import Path
+
+try:
+    from .watch_run import post
+except ImportError:  # direct script invocation
+    from watch_run import post
 
 RATE_LIMIT = re.compile(
     r"\b(?:upstream|HTTP(?:/\d(?:\.\d)?)?|status(?:_code)?[\"']?\s*[:=]?)\s*429\b"
@@ -60,7 +65,7 @@ def persist(path: Path, value: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("series", type=Path)
-    parser.add_argument("--topic", default="small-pineapple-good-morning")
+    parser.add_argument("--topic", default=os.environ.get("OPENTTD_NOTIFY_TOPIC", ""))
     parser.add_argument("--interval", type=float, default=5)
     args = parser.parse_args()
     cursor = args.series.with_name(args.series.stem + "-429-watch.json")
@@ -85,12 +90,7 @@ def main() -> None:
                     file.write(json.dumps(event) + "\n")
                     print(json.dumps(event), flush=True)
             body = "\n".join(f"{e['label']}: HTTP 429; request IDs {', '.join(e['request_ids']) or 'not recorded'}. Source: {e['file']}" for e in events)
-            try:
-                request = urllib.request.Request(f"https://ntfy.sh/{args.topic}", data=body.encode(), method="POST",
-                    headers={"Title": "OpenTTD 429 alert - agent check requested", "Priority": "high", "Tags": "warning"})
-                urllib.request.urlopen(request, timeout=30).read()
-            except Exception as exc:
-                print(json.dumps({"event": "ntfy_failed", "error": str(exc), "note": "Pi terminal notification still delivers the alert."}), flush=True)
+            post(args.topic, "OpenTTD 429 alert - agent check requested", body)
             print(json.dumps({"event": "attention_required", "count": len(events), "action": "Inspect recovery/retirement, then re-arm this watcher using the same series path."}), flush=True)
             return
         if plan["status"] in TERMINAL:

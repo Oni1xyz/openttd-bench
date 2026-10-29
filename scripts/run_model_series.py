@@ -45,7 +45,7 @@ def run(path: Path) -> int:
                 os.killpg(proc.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        post("small-pineapple-good-morning", "OpenTTD model series cancelled", "No queued games will be launched. Existing artifacts retained.")
+        post(os.environ.get("OPENTTD_NOTIFY_TOPIC", ""), "OpenTTD model series cancelled", "No queued games will be launched. Existing artifacts retained.")
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, cancel)
@@ -56,7 +56,7 @@ def run(path: Path) -> int:
     for index, stage in enumerate(plan["stages"], 1):
         plan["active_stage"] = index
         save()
-        post("small-pineapple-good-morning", f"OpenTTD model series: stage {index}/{len(plan['stages'])}",
+        post(os.environ.get("OPENTTD_NOTIFY_TOPIC", ""), f"OpenTTD model series: stage {index}/{len(plan['stages'])}",
              "Starting " + " + ".join(plan["runs"][key]["label"] for key in stage))
         active = []
         for key in stage:
@@ -81,7 +81,7 @@ def run(path: Path) -> int:
         active = []
     plan.update(status="complete_with_issues" if any_failed else "complete", finished_unix=time.time())
     save()
-    post("small-pineapple-good-morning", "OpenTTD model series finished", "\n".join(
+    post(os.environ.get("OPENTTD_NOTIFY_TOPIC", ""), "OpenTTD model series finished", "\n".join(
         f"{item['label']}: {item['status']}" for item in plan["runs"].values()))
     return int(any_failed)
 

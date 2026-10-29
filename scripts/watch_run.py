@@ -3,7 +3,7 @@
 latest in-game progress line (the env writes `outputs/progress/<spec>-<idx>.jsonl` every
 10 minutes), each completed episode's per-seat scores, and a finish notice.
 
-    python3 scripts/watch_run.py outputs/prime-ffa-x4 --topic small-pineapple-good-morning --pid <eval pid> \
+    python3 scripts/watch_run.py outputs/prime-ffa-x4 --topic YOUR_PRIVATE_TOPIC --pid <eval pid> \
         --label "free_for_all x4" --episodes 4 --start-note "4 seeds sequential on Prime ..." \
         --progress outputs/progress --heartbeat 30
 """
@@ -13,19 +13,26 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 import urllib.request
 from pathlib import Path
 
 
-def post(topic: str, title: str, body: str) -> None:
+def post(topic: str | None, title: str, body: str) -> None:
+    # No configured destination means no network request, including error notices.
+    if not topic:
+        return
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", topic):
+        raise ValueError("notification topic must contain only letters, digits, '_' or '-'")
     req = urllib.request.Request(
         f"https://ntfy.sh/{topic}", data=body.encode(), method="POST", headers={"Title": title}
     )
     try:
-        urllib.request.urlopen(req, timeout=30).read()
+        with urllib.request.urlopen(req, timeout=30) as response:
+            response.read(4096)
     except Exception as exc:  # noqa: BLE001
-        print("ntfy failed:", exc, flush=True)
+        print("ntfy failed:", type(exc).__name__, flush=True)
 
 
 def episode_summary(ep: dict, seat_labels: list[str] | None = None) -> str:
@@ -105,7 +112,7 @@ def latest_progress(progress_dir: Path, since: float, seat_labels: list[str] | N
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("outdir", type=Path)
-    parser.add_argument("--topic", required=True)
+    parser.add_argument("--topic", default=os.environ.get("OPENTTD_NOTIFY_TOPIC", ""), help="Opt-in ntfy destination; otherwise notifications stay local")
     parser.add_argument("--pid", type=int, required=True)
     parser.add_argument("--interval", type=float, default=60)
     parser.add_argument("--label", default="free_for_all x4")
