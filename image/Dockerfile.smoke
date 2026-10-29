@@ -1,0 +1,6 @@
+# Test-only image: combine the two already built, lock-derived local images.
+FROM openttd-bench-tests:hardening AS testdeps
+FROM openttd-bench:hardening
+COPY --from=testdeps /opt/venv /opt/venv
+ENV PATH=/opt/venv/bin:/opt/codex-cli/node_modules/.bin:/var/tmp/vf-node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WORKDIR /source
