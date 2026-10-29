@@ -14,6 +14,7 @@ import secrets
 import threading
 import time
 from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from server.admin_client import AdminClient, AdminPortError
 from server.barrier import ADMIN, ClockBarrier, RealtimeClock
 from server.clock import Clock
 from server.dispatcher import Dispatcher
+from server.limits import RequestLimits, bounded_thread
 from server.policy import NotVisible, event_audience
 from server.policy import apply as apply_policy
 from server.schema import Schema, SchemaError
@@ -547,6 +549,13 @@ class Core:
 
 core = Core()
 app = FastAPI(title="openttd-bench control plane", docs_url=None, redoc_url=None)
+app.add_middleware(RequestLimits, tokens={**SEAT_TOKENS, ADMIN_TOKEN: "admin"})
+_ADMIN_WORKERS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="openttd-admin")
+
+
+async def _admin_thread(function, *args):
+    # Agent waits cannot exhaust the administrative progress/snapshot workers.
+    return await bounded_thread(function, *args, executor=_ADMIN_WORKERS)
 
 
 @app.on_event("startup")
@@ -626,7 +635,7 @@ async def batch(body: BatchBody, seat: int = Depends(seat_auth)) -> dict[str, An
             cached["replayed"] = True
             return cached
     items = [item.model_dump(by_alias=True) for item in body.items]
-    response = await asyncio.to_thread(core.run_batch, seat, items, body.stop_on_error)
+    response = await bounded_thread(core.run_batch, seat, items, body.stop_on_error)
     if body.idempotency_key:
         cache = core.idempotency[seat]
         cache[body.idempotency_key] = response
@@ -638,7 +647,7 @@ async def batch(body: BatchBody, seat: int = Depends(seat_auth)) -> dict[str, An
 @app.post("/api/wait")
 async def wait(request: Request, seat: int = Depends(seat_auth)) -> dict[str, Any]:
     body = await request.json() if (await request.body()) else {}
-    return await asyncio.to_thread(core.wait, seat, body)
+    return await bounded_thread(core.wait, seat, body)
 
 
 @app.post("/api/retire")
@@ -656,7 +665,7 @@ async def events(limit: int = 100, since: float = 0.0, seat: int = Depends(seat_
 async def ticket(ticket: int, timeout: float = 0.0, seat: int = Depends(seat_auth)) -> dict[str, Any]:
     try:
         if timeout > 0:
-            return await asyncio.to_thread(core.wait_ticket, seat, ticket, min(timeout, 60.0))
+            return await bounded_thread(core.wait_ticket, seat, ticket, min(timeout, 60.0))
         return core.ticket_view(seat, ticket)
     except SchemaError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -668,7 +677,7 @@ async def ticket(ticket: int, timeout: float = 0.0, seat: int = Depends(seat_aut
 @app.post("/api/admin/ping")
 async def admin_ping(_: str = Depends(admin_auth)) -> dict[str, Any]:
     try:
-        return await asyncio.to_thread(core.ping)
+        return await _admin_thread(core.ping)
     except AdminPortError as exc:
         raise HTTPException(503, str(exc)) from exc
 
@@ -676,7 +685,7 @@ async def admin_ping(_: str = Depends(admin_auth)) -> dict[str, Any]:
 @app.post("/api/admin/configure")
 async def admin_configure(_: str = Depends(admin_auth)) -> dict[str, Any]:
     try:
-        return await asyncio.to_thread(core.configure)
+        return await _admin_thread(core.configure)
     except AdminPortError as exc:
         raise HTTPException(503, str(exc)) from exc
 
@@ -686,7 +695,7 @@ async def admin_rcon(request: Request, _: str = Depends(admin_auth)) -> dict[str
     body = await request.json()
     command = str(body.get("command", ""))
     try:
-        return {"command": command, "output": await asyncio.to_thread(core.admin.rcon, command)}
+        return {"command": command, "output": await _admin_thread(core.admin.rcon, command)}
     except (AdminPortError, ValueError) as exc:
         raise HTTPException(503, str(exc)) from exc
 
@@ -696,19 +705,19 @@ async def admin_batch(request: Request, _: str = Depends(admin_auth)) -> dict[st
     body = await request.json()
     items = body.get("items", [])
     try:
-        return {"results": await asyncio.to_thread(core.admin_batch, items)}
+        return {"results": await _admin_thread(core.admin_batch, items)}
     except AdminPortError as exc:
         raise HTTPException(503, str(exc)) from exc
 
 
 @app.post("/api/admin/pause")
 async def admin_pause(_: str = Depends(admin_auth)) -> dict[str, Any]:
-    return await asyncio.to_thread(core.clock.pause)
+    return await _admin_thread(core.clock.pause)
 
 
 @app.post("/api/admin/unpause")
 async def admin_unpause(_: str = Depends(admin_auth)) -> dict[str, Any]:
-    return await asyncio.to_thread(core.clock.unpause)
+    return await _admin_thread(core.clock.unpause)
 
 
 @app.post("/api/admin/start_clock")
@@ -735,12 +744,12 @@ async def admin_retire(request: Request, _: str = Depends(admin_auth)) -> dict[s
 async def admin_run_out(request: Request, _: str = Depends(admin_auth)) -> dict[str, Any]:
     body = await request.json() if (await request.body()) else {}
     timeout = float(body.get("timeout_seconds", 10800))
-    return await asyncio.to_thread(core.run_out, timeout)
+    return await _admin_thread(core.run_out, timeout)
 
 
 @app.get("/api/admin/snapshot")
 async def admin_snapshot(_: str = Depends(admin_auth)) -> dict[str, Any]:
-    return await asyncio.to_thread(core.snapshot)
+    return await _admin_thread(core.snapshot)
 
 
 @app.get("/api/admin/events")
@@ -753,7 +762,7 @@ async def admin_save(request: Request, _: str = Depends(admin_auth)) -> dict[str
     body = await request.json() if (await request.body()) else {}
     name = "".join(ch for ch in str(body.get("name", "terminal")) if ch.isalnum() or ch in "-_") or "terminal"
     try:
-        output = await asyncio.to_thread(core.admin.rcon, f"save {name}", 60)
+        output = await _admin_thread(core.admin.rcon, f"save {name}", 60)
     except AdminPortError as exc:
         raise HTTPException(503, str(exc)) from exc
     save_dir = Path(os.environ.get("OPENTTD_SAVE_DIR", str(Path.home() / ".local/share/openttd/save")))
