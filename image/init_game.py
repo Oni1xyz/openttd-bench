@@ -107,8 +107,7 @@ def acquire_binaries(paths: Paths) -> Path:
     if binary.exists() and (paths.install / "baseset").exists() and (paths.install / "ai" / "RailwAI-30").exists():
         log(f"binaries present at {paths.install}")
         return binary
-    log("acquiring pinned OpenTTD 15.3 + basesets + RailwAI (bootstrap path)")
-    return fetch_content.install(paths.cache, paths.install)
+    raise RuntimeError("missing prebuilt game assets; rebuild the hardened image (runtime downloads are disabled)")
 
 
 def patch_speed(paths: Paths, percent: int) -> Path:
@@ -519,12 +518,8 @@ def ensure_python_deps() -> None:
     try:
         import fastapi  # noqa: F401
         import uvicorn  # noqa: F401
-    except ImportError:
-        log("installing control plane dependencies (bootstrap path)")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", "--no-cache-dir", "fastapi", "uvicorn", "pydantic"],
-            check=True,
-        )
+    except ImportError as exc:
+        raise RuntimeError("missing prebuilt Python dependencies; rebuild the hardened image") from exc
 
 
 def ensure_system_deps(paths: Paths) -> None:
@@ -532,24 +527,7 @@ def ensure_system_deps(paths: Paths) -> None:
         return
     missing = [lib for lib in ("libgomp.so.1", "libglib-2.0.so.0") if not _lib_present(lib)]
     if missing or shutil.which("setpriv") is None:
-        log(f"installing system libraries (bootstrap path): {missing}")
-        subprocess.run(["apt-get", "update", "-qq"], check=True, stdout=subprocess.DEVNULL)
-        subprocess.run(
-            [
-                "apt-get",
-                "install",
-                "-y",
-                "-qq",
-                "--no-install-recommends",
-                "libgomp1",
-                "libglib2.0-0",
-                "util-linux",
-                "procps",
-                "ca-certificates",
-            ],
-            check=True,
-            stdout=subprocess.DEVNULL,
-        )
+        raise RuntimeError(f"missing prebuilt system dependencies: {missing}; rebuild the hardened image")
 
 
 def _lib_present(name: str) -> bool:
@@ -603,7 +581,7 @@ def main() -> None:
         import fetch_content
 
         no_loans = world["rules"].get("max_loan") == 0
-        fetch_content.install_hogex(paths.cache, paths.install, no_loans=no_loans)
+        fetch_content.install_hogex(paths.cache, paths.install, no_loans=no_loans, offline=True)
         log("installed pinned AAAHogEx v115" + (" with zero-loan inflation guard" if no_loans else ""))
     patched = patch_speed(paths, percent)
     cfg = write_cfg(paths, world, admin_password)

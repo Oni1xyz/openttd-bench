@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Pinned, checksummed content acquisition: OpenTTD 15.3, OpenGFX, OpenSFX, RailwAI.
 
-Runs at image build (Dockerfile) and again, idempotently, from `init_game` so a stock
-public image bootstraps itself at setup (Prime sandboxes have egress then).
+Network acquisition runs only at image build. Runtime consumers require the
+already verified image cache and never bootstrap from an unprepared image.
 `--cache` keeps the downloads; `--install` is the OpenTTD installation tree
 (binary, baseset/, ai/, game/) that the game process runs from.
 """
@@ -62,7 +62,7 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def fetch(cache: Path, assets: dict | None = None) -> dict[str, Path]:
+def fetch(cache: Path, assets: dict | None = None, *, offline: bool = False) -> dict[str, Path]:
     cache.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
     for key, asset in (ASSETS if assets is None else assets).items():
@@ -70,12 +70,19 @@ def fetch(cache: Path, assets: dict | None = None) -> dict[str, Path]:
         if target.exists() and sha256(target) == asset["sha256"]:
             paths[key] = target
             continue
+        if offline:
+            raise RuntimeError(f"missing or invalid prebuilt asset {asset['file']}; rebuild the hardened image")
         print(f"fetching {asset['url']}", flush=True)
         tmp = target.with_suffix(target.suffix + ".part")
         # The OpenTTD CDN refuses Python's default User-Agent (HTTP 403); identify ourselves.
         request = urllib.request.Request(asset["url"], headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(request, timeout=120) as resp, tmp.open("wb") as out:
-            shutil.copyfileobj(resp, out)
+            total = 0
+            while chunk := resp.read(1024 * 1024):
+                total += len(chunk)
+                if total > 256 * 1024 * 1024:
+                    raise RuntimeError("content download exceeds 256 MiB")
+                out.write(chunk)
         digest = sha256(tmp)
         if digest != asset["sha256"]:
             tmp.unlink(missing_ok=True)
@@ -99,7 +106,7 @@ def install(cache: Path, install_dir: Path) -> Path:
                     continue
                 member.name = member.name[len(top) + 1 :]
                 if member.name:
-                    tar.extract(member, install_dir)
+                    tar.extract(member, install_dir, filter="data")
         binary.chmod(0o755)
     baseset = install_dir / "baseset"
     baseset.mkdir(exist_ok=True)
@@ -107,20 +114,22 @@ def install(cache: Path, install_dir: Path) -> Path:
         with zipfile.ZipFile(paths[key]) as zf:
             for name in zf.namelist():
                 if name.endswith(".tar") and not (baseset / Path(name).name).exists():
+                    if zf.getinfo(name).file_size > 64 * 1024 * 1024:
+                        raise RuntimeError("baseset member exceeds 64 MiB")
                     (baseset / Path(name).name).write_bytes(zf.read(name))
     ai_dir = install_dir / "ai"
     ai_dir.mkdir(exist_ok=True)
     railwai = ai_dir / "RailwAI-30"
     if not railwai.exists():
         with tarfile.open(paths["railwai"], "r:gz") as tar:
-            tar.extractall(ai_dir)
+            tar.extractall(ai_dir, filter="data")
     (install_dir / "game").mkdir(exist_ok=True)
     return binary
 
 
-def install_hogex(cache: Path, install_dir: Path, *, no_loans: bool = False) -> Path:
+def install_hogex(cache: Path, install_dir: Path, *, no_loans: bool = False, offline: bool = False) -> Path:
     """Install exactly the baseline HogEx version, only when a world requests it."""
-    archive = fetch(cache, {"hogex": HOGEX_ASSET})["hogex"]
+    archive = fetch(cache, {"hogex": HOGEX_ASSET}, offline=offline)["hogex"]
     ai_dir = install_dir / "ai"
     ai_dir.mkdir(parents=True, exist_ok=True)
     target = ai_dir / f"AAAHogEx-{HOGEX_COMMIT}"
