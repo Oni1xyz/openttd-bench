@@ -1,0 +1,14 @@
+{
+  "review_cutoff": "2026-10-22T00:00:00Z",
+  "architecture": "linux-x64",
+  "python_image": "python:3.12.13-slim-bookworm@sha256:6e13e65c55e33adf203d77ee371cf8bf5d81bd4902ef07565721f46bf44917af",
+  "debian_snapshot": "20261022T000000Z",
+  "node": {
+    "version": "v22.23.4",
+    "release_date": "2026-10-20",
+    "url": "https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.xz",
+    "sha256": "1805bcd35e6815559bd2eb97db438d3fdb0eb3a5e6a977b7c1badca76337e9ce",
+    "file": "node-v22.23.4-linux-x64.tar.xz"
+  },
+  "codex": "0.162.1"
+}

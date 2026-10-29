@@ -1,0 +1,10 @@
+# Dependency-only test image: no project code runs during the build.
+FROM python:3.12.13-slim-bookworm@sha256:6e13e65c55e33adf203d77ee371cf8bf5d81bd4902ef07565721f46bf44917af
+ENV PYTHONDONTWRITEBYTECODE=1 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
+COPY image/test-requirements.lock /opt/test-requirements.lock
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/python -m pip install --only-binary=:all: --require-hashes -r /opt/test-requirements.lock
+ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin HOME=/work TMPDIR=/work
+USER 65534:65534
+WORKDIR /source
+CMD ["python", "-m", "pytest", "-p", "no:cacheprovider"]

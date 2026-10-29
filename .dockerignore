@@ -1,0 +1,15 @@
+.git
+.env
+.env.*
+.venv
+node_modules
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+viewer/.next
+outputs
+*.sav
+*.log
+*.whl
+*.tar.gz
+*.tar.xz

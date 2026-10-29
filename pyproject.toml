@@ -3,13 +3,16 @@ name = "openttd-bench"
 version = "3.0.0"
 description = "OpenTTD bench v3: a multi-agent-by-default OpenTTD benchmark for LLM coding agents on the verifiers framework."
 requires-python = ">=3.11,<3.14"
-dependencies = ["verifiers>=0.3.1", "pydantic>=2"]
+dependencies = ["verifiers==0.3.1", "pydantic>=2,<3"]
 
 [project.optional-dependencies]
-dev = ["pytest", "fastapi", "uvicorn", "httpx"]
+dev = ["pytest", "fastapi", "uvicorn", "httpx", "hatchling==1.32.4"]
+
+[dependency-groups]
+image = ["fastapi", "uvicorn", "pydantic>=2,<3"]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
@@ -17,6 +20,15 @@ packages = ["openttd_bench", "harnesses/openttd_seat", "harnesses/opencode", "ha
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv]
+# Conservative fixed review cutoff; advance only with a fresh age/advisory audit.
+exclude-newer = "2026-10-22T00:00:00Z"
+constraint-dependencies = [
+  "aiohttp>=3.14.4,<3.15", "certifi>=2026.10.19", "filelock>=4.2.1,<5",
+  "msgpack>=1.2.3,<2", "multidict>=6.9.1,<7", "opentelemetry-api>=1.45.1,<2",
+  "pyjwt>=2.15.0,<3", "urllib3>=2.8.0,<3",
+]
 
 [tool.ruff]
 line-length = 120
