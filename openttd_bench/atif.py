@@ -9,11 +9,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
+import re
 from collections import defaultdict
+from contextlib import ExitStack
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from openttd_bench.safe_files import BoundaryError, Budget, InvalidJSON, Limits, SafeRoot, check_value, decode_json, decode_records
 
 VERSION = "ATIF-v1.8"
 
@@ -33,8 +37,9 @@ def text(value: Any) -> str:
 def arguments(value: Any) -> dict:
     if isinstance(value, str):
         try:
-            decoded = json.loads(value)
-        except ValueError:
+            # Embedded tool JSON is another input boundary, not trusted structure.
+            decoded = decode_json(value, Budget())
+        except InvalidJSON:
             return {"raw": value}
     else:
         decoded = value
@@ -94,12 +99,17 @@ def add_result(s: dict, content: Any, call_id: str | None = None, **extra: Any) 
     return result
 
 
-def prime_trajectory(trace: dict, episode: dict | None = None) -> dict:
+def prime_trajectory(trace: dict, episode: dict | None = None, *, limits: Limits | None = None) -> dict:
     """Partition explicitly identifiable subagents; preserve other context roots in-place.
 
     Prime has no thread IDs. Only an exact Agent prompt match identifies a child;
     unrelated/restarted/compacted roots are not guessed to be subagents.
     """
+    limits = limits or Limits()
+    check_value(trace, Budget(limits))
+    if len(trace.get("nodes", [])) > limits.graph_nodes or len(trace.get("calls", [])) > limits.graph_nodes:
+        raise BoundaryError("Prime graph limit exceeded")
+    work = 0
     cfg = trace.get("agent", {}).get("config", {})
     harness = cfg.get("harness", {})
     tid = trace["id"]
@@ -128,6 +138,9 @@ def prime_trajectory(trace: dict, episode: dict | None = None) -> dict:
             prompt = args.get("prompt")
             if not isinstance(prompt, str) or not prompt:
                 continue
+            work += len(nodes)
+            if work > limits.graph_work:
+                raise BoundaryError("Prime graph work limit exceeded")
             matches = {roots[j] for j, m in enumerate(nodes) if j > i and roots[j] != roots[i]
                        and m["message"]["role"] == "user" and prompt in text(m["message"].get("content"))}
             if len(matches) == 1:
@@ -202,6 +215,9 @@ def prime_trajectory(trace: dict, episode: dict | None = None) -> dict:
                 continue
             for c in s.get("tool_calls", []):
                 existing = s.get("observation", {}).get("results", [])
+                work += len(existing) + len(observations[c["tool_call_id"]])
+                if work > limits.graph_work:
+                    raise BoundaryError("Prime graph work limit exceeded")
                 if not any(r.get("source_call_id") == c["tool_call_id"] for r in existing):
                     seen_content = set()
                     for result in observations[c["tool_call_id"]]:
@@ -230,7 +246,11 @@ def prime_trajectory(trace: dict, episode: dict | None = None) -> dict:
     return finish(doc)
 
 
-def codex_trajectory(records: list[dict]) -> dict:
+def codex_trajectory(records: list[dict], *, limits: Limits | None = None) -> dict:
+    limits = limits or Limits()
+    if len(records) > limits.records:
+        raise BoundaryError("Artifact records limit exceeded")
+    check_value(records, Budget(limits))
     meta = next(r["payload"] for r in records if r.get("type") == "session_meta")
     tid = meta["id"]
     origin = meta.get("source", {})
@@ -307,17 +327,38 @@ def codex_trajectory(records: list[dict]) -> dict:
     return finish(doc)
 
 
-def codex_forest(directory: Path) -> list[dict]:
-    docs = {}
-    for file in sorted(directory.rglob("*.jsonl")):
-        if file.name == "codex-exec.jsonl":
+def _load_codex(root: SafeRoot, directory: Path, budget: Budget) -> tuple[list, list]:
+    sessions, artifacts = [], []
+    for file, is_dir in root.walk(budget, directory):
+        if is_dir or file.suffix != ".jsonl":
             continue
-        raw = file.read_text()
-        records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        data = root.read(file, budget)
+        if file.name == "codex-exec.jsonl":
+            try:
+                artifacts.append({"path": str(root.path / file), "content": data.decode("utf-8")})
+            except UnicodeError:
+                raise BoundaryError("Invalid artifact encoding") from None
+        else:
+            records = [r for _, r in decode_records(data, budget)]
+            sessions.append((str(root.path / file), hashlib.sha256(data).hexdigest(), records))
+    return sessions, artifacts
+
+
+def codex_forest(directory: Path, *, limits: Limits | None = None) -> list[dict]:
+    """Read an explicit operator-approved tree; only its root may be a symlink."""
+    budget = Budget(limits)
+    with SafeRoot(directory) as root:
+        return _codex_forest(_load_codex(root, Path("."), budget), budget.limits)
+
+
+def _codex_forest(loaded: tuple[list, list], limits: Limits) -> list[dict]:
+    sessions, artifacts = loaded
+    docs = {}
+    for path, digest, records in sessions:
         if not records or not any(r.get("type") == "session_meta" for r in records):
             continue
-        doc = codex_trajectory(records)
-        doc["extra"]["source"].update(path=str(file), sha256=hashlib.sha256(file.read_bytes()).hexdigest())
+        doc = codex_trajectory(records, limits=limits)
+        doc["extra"]["source"].update(path=path, sha256=digest)
         tid = doc["trajectory_id"]
         if tid in docs:
             # Crash-safe snapshots can duplicate the final harvest. Only accept prefixes.
@@ -329,6 +370,7 @@ def codex_forest(directory: Path) -> list[dict]:
         else:
             docs[tid] = doc
     roots = []
+    work = 0
     for tid, doc in docs.items():
         parent = doc["extra"]["parent_trajectory_id"]
         if parent in docs:
@@ -339,11 +381,16 @@ def codex_forest(directory: Path) -> list[dict]:
                 if cursor in seen:
                     raise ValueError(f"Codex parent cycle: {tid}")
                 seen.add(cursor)
+                if len(seen) > limits.depth:
+                    raise BoundaryError("Codex graph depth limit exceeded")
                 cursor = docs[cursor]["extra"]["parent_trajectory_id"]
             docs[parent].setdefault("subagent_trajectories", []).append(doc)
             meta = next(r["payload"] for r in doc["extra"]["source"]["records"] if r["type"] == "session_meta")
             agent_path = meta.get("agent_path")
             for s in docs[parent]["steps"]:
+                work += 1
+                if work > limits.graph_work:
+                    raise BoundaryError("Codex graph work limit exceeded")
                 if not any(c["function_name"] == "spawn_agent" for c in s.get("tool_calls", [])):
                     continue
                 for result in s.get("observation", {}).get("results", []):
@@ -352,101 +399,191 @@ def codex_forest(directory: Path) -> list[dict]:
                         result.setdefault("subagent_trajectory_ref", []).append({"trajectory_id": tid})
         else:
             roots.append(doc)
-    artifacts = [{"path": str(p), "content": p.read_text()} for p in sorted(directory.rglob("codex-exec.jsonl"))]
     if roots and artifacts:
         roots[0]["extra"]["source"]["artifacts"] = artifacts
     return roots
 
 
 def resolve_harvest(path: str, run: Path) -> Path:
-    p = Path(path)
-    if p.exists():
-        return p
-    relocated = run / "raw" / "codex" / p.name
-    if relocated.is_dir():
-        return relocated
-    # Old runs can be moved as a unit under outputs/archived.
-    parts = p.parts
-    if "outputs" in parts:
-        p = run.parent / "archived" / Path(*parts[parts.index("outputs") + 1:])
-    return p
+    """Treat trace paths only as run-local hints, never as filesystem authority.
+
+    The sole implicit root is RUN/raw/codex. For relocation, a historical prefix
+    ending in raw/codex is discarded, even if that old absolute path still exists.
+    No cwd, sibling archived run, or basename-only external fallback is consulted.
+    Symlink checks happen through the selected run descriptor, not Path.resolve().
+    """
+    if not isinstance(path, str) or not path or len(path) > 4096 or "\\" in path or "\x00" in path:
+        raise BoundaryError("Unsafe harvested_to path")
+    parts = path.split("/")
+    if path.startswith("/"):
+        parts = parts[1:]
+    if any(p in ("", ".", "..") for p in parts):
+        raise BoundaryError("Unsafe harvested_to path")
+    markers = [i for i in range(len(parts) - 1) if parts[i:i + 2] == ["raw", "codex"]]
+    if len(markers) != 1:
+        raise BoundaryError("harvested_to must identify RUN/raw/codex")
+    tail = parts[markers[0] + 2:]
+    if not tail or not re.fullmatch(r"agent[1-9][0-9]*(?:-[A-Za-z0-9_.-]+)?", tail[0]):
+        raise BoundaryError("harvested_to must identify a seat directory")
+    return run / "raw" / "codex" / Path(*tail)
 
 
-def convert_run(run: Path, codex_dirs: list[Path] | None = None) -> dict:
-    run = run.resolve()
-    documents = []
-    consumed_dirs: set[Path] = set()
-    sources = sorted(p for p in run.rglob("traces.jsonl") if "trajectories" not in p.relative_to(run).parts)
-    for file in sources:
-        for line_number, line in enumerate(file.read_text().splitlines(), 1):
-            if not line.strip():
+def _seat_name(value) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"agent[1-9][0-9]*", value):
+        raise BoundaryError("Missing/ambiguous Codex sessions: valid seat_user required")
+    return value
+
+
+def _seat_matches(name: str, seat: str) -> bool:
+    return name == seat or name.startswith(seat + "-")
+
+
+def _select_codex(trace: dict, root: SafeRoot, approved: list[SafeRoot], trees: dict) -> tuple[SafeRoot, Path] | None:
+    info = trace.get("info", {})
+    session = info.get("harness_session", {})
+    harvest = session.get("harvested_to")
+    is_codex = trace.get("agent", {}).get("config", {}).get("harness", {}).get("id") in ("codex-cli", "codex_cli")
+    if harvest is None and not is_codex:
+        return None
+    if harvest is not None:
+        directory = resolve_harvest(harvest, root.path).relative_to(root.path)
+        if "seat_user" in info and not _seat_matches(directory.parts[2], _seat_name(info["seat_user"])):
+            raise BoundaryError("Codex harvest seat mismatch")
+        if not root.is_dir(directory):
+            raise BoundaryError("Missing/ambiguous Codex sessions")
+        return root, directory
+    seat = _seat_name(info.get("seat_user"))
+    candidates = {}
+    # Only direct seat children of an approved root can be inferred. Never walk
+    # arbitrary trees by basename or use an empty seat to select all histories.
+    for base in [root, *approved]:
+        prefix = Path("raw/codex") if base is root else Path(".")
+        if base is not root and _seat_matches(base.path.name, seat):
+            candidates[base.path] = (base, Path("."))
+        for relative, is_dir in trees[base.path]:
+            if is_dir and relative.parent == prefix and _seat_matches(relative.name, seat):
+                candidates[base.path / relative] = (base, relative)
+    if len(candidates) != 1:
+        raise BoundaryError("Missing/ambiguous Codex sessions; supply an explicit seat directory")
+    return next(iter(candidates.values()))
+
+
+def _encode(doc: dict, limits: Limits, remaining: int) -> bytes:
+    # Preflight the expanded graph and stream encoding under a shared output cap.
+    check_value(doc, Budget(replace(limits, depth=limits.depth * 4, nodes=limits.nodes * 8,
+                                   total_bytes=limits.output_bytes)))
+    chunks = []
+    size = 1
+    for chunk in json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False).iterencode(doc):
+        encoded = chunk.encode("utf-8")
+        size += len(encoded)
+        if size > remaining:
+            raise BoundaryError("Artifact output bytes limit exceeded")
+        chunks.append(encoded)
+    return b"".join(chunks) + b"\n"
+
+
+def convert_run(run: Path, codex_dirs: list[Path] | None = None, *, limits: Limits | None = None) -> dict:
+    """Convert only bounded regular inputs, then prevalidate and publish manifest-last.
+
+    `run` and `codex_dirs` are explicit operator selections, so their root symlinks
+    may be canonicalized. Untrusted harvested_to paths cannot add approved roots.
+    Descendant symlinks/special files are rejected, including publication targets.
+    """
+    budget = Budget(limits)
+    limits = budget.limits
+    with ExitStack() as stack:
+        root = stack.enter_context(SafeRoot(run))
+        root.validate_target("trajectories/index.json")
+        approved = []
+        roots = {root.path}
+        for path in codex_dirs or []:
+            selected = stack.enter_context(SafeRoot(path))
+            if selected.path not in roots:
+                roots.add(selected.path)
+                approved.append(selected)
+        trees = {base.path: base.walk(budget, exclude=("trajectories",) if base is root else ())
+                 for base in [root, *approved]}
+        jobs, loaded, consumed = [], {}, set()
+        # Complete byte/record/node/depth preflight of all selected inputs before
+        # invoking either converter. Failures cannot partially publish a run.
+        for file, is_dir in trees[root.path]:
+            if is_dir or file.name != "traces.jsonl":
                 continue
-            record = json.loads(line)
-            episode = {k: v for k, v in record.items() if k != "traces"} if "traces" in record else {"id": record["id"]}
-            for trace in record.get("traces", [record]):
-                doc = prime_trajectory(trace, episode)
-                doc["extra"]["source"].update(path=str(file.relative_to(run)), line=line_number)
-                session = trace.get("info", {}).get("harness_session", {})
-                harvest = session.get("harvested_to")
-                is_codex = trace.get("agent", {}).get("config", {}).get("harness", {}).get("id") in ("codex-cli", "codex_cli")
-                if harvest or is_codex:
-                    directory = resolve_harvest(harvest, run) if harvest else run / "raw" / "codex" / trace.get("info", {}).get("seat_user", "")
-                    native = codex_forest(directory) if directory.is_dir() else []
-                    if not native:
-                        seat = trace.get("info", {}).get("seat_user")
-                        candidates = []
-                        for base in [run / "raw" / "codex", *(codex_dirs or [])]:
-                            if not base.is_dir() or not seat:
-                                continue
-                            if base.name == seat or base.name.startswith(seat + "-"):
-                                candidates.append(base)
-                            candidates.extend(p for p in base.rglob("*") if p.is_dir() and (p.name == seat or p.name.startswith(seat + "-")))
-                        if len(candidates) == 1:
-                            directory = candidates[0]
-                            native = codex_forest(directory)
-                        if not native:
-                            raise ValueError(f"Missing/ambiguous Codex sessions for {trace['id']}: {directory}; supply --codex-dir with seat directories")
-                    consumed_dirs.add(directory.resolve())
-                    if len(native) == 1:
-                        native[0]["extra"].update(benchmark=doc["extra"]["benchmark"], episode=episode,
-                                                  prime_source=doc["extra"]["source"])
-                        doc = native[0]
-                    else:
-                        doc["subagent_trajectories"] = native
-                        doc["notes"] = "Multiple native root sessions for this seat; retained independently."
-                documents.append(doc)
-    for directory in codex_dirs or []:
-        if not any(directory.resolve() == p or directory.resolve() in p.parents for p in consumed_dirs):
-            documents.extend(codex_forest(directory))
-    if not documents:
-        raise ValueError(f"No trajectories found in {run}")
-    dest = run / "trajectories"
-    dest.mkdir(parents=True, exist_ok=True)
-    entries = []
-    for doc in documents:
-        # Content-addressed files + manifest-last publication: readers see a complete generation.
-        data = json.dumps(doc, ensure_ascii=False, separators=(",", ":")) + "\n"
-        digest = hashlib.sha256(data.encode()).hexdigest()
-        filename = f"{digest}.atif.json"
-        atomic_write(dest / filename, data)
-        ep = doc.get("extra", {}).get("episode", {"id": doc["session_id"]})
-        entries.append({"file": filename, "trajectory_id": doc["trajectory_id"], "episode_id": ep["id"],
-                        "sha256": digest, "size": len(data.encode())})
-    manifest = {"format": "openttd-atif-index-v1", "run": run.name, "trajectories": entries}
-    atomic_write(dest / "index.json", json.dumps(manifest, indent=2) + "\n")
-    return manifest
-
-
-def atomic_write(path: Path, data: str) -> None:
-    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text(data)
-    tmp.replace(path)
+            for line_number, record in decode_records(root.read(file, budget), budget):
+                episode = {k: v for k, v in record.items() if k != "traces"} if "traces" in record else {"id": record["id"]}
+                traces = record.get("traces", [record])
+                if not isinstance(traces, list) or len(traces) > limits.graph_nodes:
+                    raise BoundaryError("Invalid or oversized trace collection")
+                for trace in traces:
+                    if not isinstance(trace, dict):
+                        raise BoundaryError("Trace must be an object")
+                    selected = _select_codex(trace, root, approved, trees)
+                    key = None
+                    if selected:
+                        base, directory = selected
+                        key = base.path / directory
+                        if key in consumed:
+                            raise BoundaryError("Codex session tree reused across traces")
+                        if key not in loaded:
+                            loaded[key] = _load_codex(base, directory, budget)
+                        consumed.add(key)
+                    jobs.append((trace, episode, file, line_number, key))
+        standalone = []
+        for base in approved:
+            if any(base.path == p or base.path in p.parents for p in consumed):
+                continue
+            if base.path not in loaded:
+                loaded[base.path] = _load_codex(base, Path("."), budget)
+            standalone.append(base.path)
+        documents = []
+        for trace, episode, file, line_number, key in jobs:
+            doc = prime_trajectory(trace, episode, limits=limits)
+            doc["extra"]["source"].update(path=str(file), line=line_number)
+            if key is not None:
+                native = _codex_forest(loaded[key], limits)
+                if not native:
+                    raise BoundaryError("Missing/ambiguous Codex sessions")
+                if len(native) == 1:
+                    native[0]["extra"].update(benchmark=doc["extra"]["benchmark"], episode=episode,
+                                              prime_source=doc["extra"]["source"])
+                    doc = native[0]
+                else:
+                    doc["subagent_trajectories"] = native
+                    doc["notes"] = "Multiple native root sessions for this seat; retained independently."
+            documents.append(doc)
+        for key in standalone:
+            documents.extend(_codex_forest(loaded[key], limits))
+        if not documents:
+            raise ValueError("No trajectories found in selected run")
+        entries, outputs = [], []
+        remaining = limits.output_bytes
+        for doc in documents:
+            data = _encode(doc, limits, remaining)
+            remaining -= len(data)
+            digest = hashlib.sha256(data).hexdigest()
+            filename = f"{digest}.atif.json"
+            ep = doc.get("extra", {}).get("episode", {"id": doc["session_id"]})
+            entries.append({"file": filename, "trajectory_id": doc["trajectory_id"], "episode_id": ep["id"],
+                            "sha256": digest, "size": len(data)})
+            outputs.append((Path("trajectories") / filename, data))
+        manifest = {"format": "openttd-atif-index-v1", "run": root.path.name, "trajectories": entries}
+        outputs.append((Path("trajectories/index.json"), _encode(manifest, limits, remaining)))
+        # Validate ALL targets before mkdir or the first write, retaining the old
+        # manifest and external canaries if any target is an unsafe descendant.
+        for path, _ in outputs:
+            root.validate_target(path)
+        root.mkdir("trajectories")
+        for path, data in outputs:
+            root.atomic_write(path, data)
+        return manifest
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path, help="run directory; writes RUN/trajectories")
-    parser.add_argument("--codex-dir", type=Path, action="append", default=[], help="additional standalone Codex session tree (repeatable)")
+    parser.add_argument("--codex-dir", type=Path, action="append", default=[],
+                        help="explicitly approve another Codex tree (repeatable; root symlink allowed, descendants forbidden)")
     args = parser.parse_args()
     manifest = convert_run(args.run, args.codex_dir)
     print(f"{args.run}/trajectories: {len(manifest['trajectories'])} root trajectories")

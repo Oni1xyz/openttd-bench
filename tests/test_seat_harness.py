@@ -41,7 +41,7 @@ class FakeBox(Runtime):
     async def run(self, argv, env):
         self.calls.append((argv, env))
         self.order.append("run:" + argv[0])
-        if argv[:2] == ["python3", "-c"] and self.summary is not None:
+        if argv[0] == "setpriv" and "python3" in argv and self.summary is not None:
             return ProgramResult(0, json.dumps(self.summary), "")
         return ProgramResult(0, "program output", "")
 
@@ -165,9 +165,11 @@ def test_opencode_files_env_script_and_summary():
     script = argv[6]
     assert 'PATH="/opt/opencode/bin:$PATH"' in script and 'OPENCODE_DISABLE_FILETIME_CHECK="true"' in script
     assert script.endswith("cd /home/agent3/work && cat /home/agent3/task-prompt.md | opencode run 2>&1")
-    # The store walk runs as root on the seat home and lands in the trace.
+    # The bounded store walk drops to the seat before Python starts.
     summary_argv, _ = box.calls[2]
-    assert summary_argv[:2] == ["python3", "-c"] and summary_argv[3] == "/home/agent3"
+    assert summary_argv[:5] == ["setpriv", "--reuid=agent3", "--regid=agent3", "--init-groups", "--no-new-privs"]
+    assert summary_argv[5:8] == ["timeout", "--signal=KILL", "15s"]
+    assert summary_argv[8:12] == ["python3", "-I", "-S", "-c"] and summary_argv[-1] == "/home/agent3"
     assert trace.info["harness_session"] == summary
     assert "opencode_output_tail" not in trace.info  # renamed: harness_output_tail
 
